@@ -4,7 +4,7 @@ This is my personal fork as I use IW3 and I coded a render queue and shut down c
 
 Everything is in the gui.py file in IW3 so just copy that over to your copy if you have already installed it.
 
-(I don't do support or help only if it's broken for will I update)
+(I don't do support or help only if it's broken for me will I update)
 
 
 
