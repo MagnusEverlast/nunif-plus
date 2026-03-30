@@ -11,6 +11,7 @@ import wx
 from wx.lib.delayedresult import startWorker
 import wx.lib.agw.persist as persist
 import wx.lib.stattext as stattext
+import wx.lib.scrolledpanel as scrolled
 import torch
 from .utils import (
     create_parser, set_state_args, iw3_main,
@@ -116,6 +117,10 @@ class MainFrame(wx.Frame):
         self.depth_model_device_id = None
         self.depth_model_height = None
         self.depth_model_limit_resolution = None
+        self.queue_jobs = []  # Store queued jobs
+        self.queue_shutdown = False  # Shutdown when queue is done
+        self.queue_process = False  # True when processing queue
+        self.queue_idx = -1  # Current job index
         self.initialize_component()
         if is_dark_mode():
             apply_dark_mode(self)
@@ -677,6 +682,50 @@ class MainFrame(wx.Frame):
         layout.Add(self.btn_cancel, 0, wx.ALL, 4)
         self.pnl_process.SetSizer(layout)
 
+        # render queue panel
+        self.pnl_queue = wx.Panel(self)
+        if LAYOUT_DEBUG:
+            self.pnl_queue.SetBackgroundColour("#ccf")
+        self.lbl_queue = wx.StaticText(self.pnl_queue, label=T("Render Queue"))
+        self.list_queue = wx.ListCtrl(self.pnl_queue, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_SORT_ASCENDING)
+        self.list_queue.InsertColumn(0, T("Input"))
+        self.list_queue.InsertColumn(1, T("Output"))
+        self.list_queue.InsertColumn(2, T("Status"))
+        self.list_queue.InsertColumn(3, T("Arguments"))
+        self.list_queue.SetColumnWidth(0, self.FromDIP(200))
+        self.list_queue.SetColumnWidth(1, self.FromDIP(200))
+        self.list_queue.SetColumnWidth(2, self.FromDIP(80))
+        self.list_queue.SetColumnWidth(3, self.FromDIP(200))
+
+        self.btn_add_queue = wx.Button(self.pnl_queue, label=T("Add to Queue"))
+        self.btn_remove_queue = wx.Button(self.pnl_queue, label=T("Remove"))
+        self.btn_clear_queue = wx.Button(self.pnl_queue, label=T("Clear"))
+        self.btn_start_queue = wx.Button(self.pnl_queue, label=T("Start Queue"))
+        self.btn_clear_completed = wx.Button(self.pnl_queue, label=T("Clear Completed"))
+        self.chk_shutdown_queue = wx.CheckBox(self.pnl_queue, label=T("Shutdown when finished"),
+                                             name="chk_shutdown_queue")
+        self.chk_shutdown_queue.SetMinSize(self.FromDIP((280, -1)))
+
+        # Button row for queue controls
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.Add(self.btn_add_queue, flag=wx.ALL, border=4)
+        btn_row.Add(self.btn_remove_queue, flag=wx.ALL, border=4)
+        btn_row.Add(self.btn_clear_queue, flag=wx.ALL, border=4)
+        btn_row.Add(self.btn_start_queue, flag=wx.ALL, border=4)
+        btn_row.Add(self.btn_clear_completed, flag=wx.ALL, border=4)
+
+        layout = wx.BoxSizer(wx.VERTICAL)
+        layout.Add(self.lbl_queue, flag=wx.ALL, border=4)
+        layout.Add(self.list_queue, 1, flag=wx.LEFT | wx.RIGHT | wx.EXPAND, border=4)
+        layout.Add(btn_row, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.ALIGN_LEFT, border=4)
+
+        # Shutdown checkbox with proper alignment like other checkboxes
+        shutdown_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        shutdown_sizer.Add(self.chk_shutdown_queue, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=6)
+        layout.Add(shutdown_sizer, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.ALIGN_LEFT, border=8)
+
+        self.pnl_queue.SetSizer(layout)
+
         # main layout
 
         layout = wx.BoxSizer(wx.VERTICAL)
@@ -685,10 +734,23 @@ class MainFrame(wx.Frame):
         layout.Add(self.pnl_file.panel, 0, wx.ALL | wx.EXPAND, 8)
         layout.Add(self.pnl_file_option, 0, wx.ALL | wx.EXPAND, 4)
         layout.Add(self.pnl_options, 1, wx.ALL | wx.EXPAND, 8)
-        layout.Add(self.pnl_process, 0, wx.ALL | wx.EXPAND, 8)
+        layout.Add(self.pnl_queue, 0, wx.ALL | wx.EXPAND, 8)  # queue now above
+        layout.Add(self.pnl_process, 0, wx.ALL | wx.EXPAND, 8)  # single-job bar at bottom
         self.SetSizer(layout)
 
         # bind
+        # Render Queue bindings
+        self.btn_add_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_add_queue)
+        self.btn_remove_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_remove_queue)
+        self.btn_clear_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_clear_queue)
+        self.btn_start_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_start_queue)
+        self.btn_clear_completed.Bind(wx.EVT_BUTTON, self.on_click_btn_clear_completed)
+        self.chk_shutdown_queue.Bind(wx.EVT_CHECKBOX, self.on_shutdown_queue_changed)
+        self.list_queue.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select_queue_item)
+        self.list_queue.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_deselect_queue_item)
+
+        # Bind EVT_CLOSE for queue shutdown
+        self.Bind(wx.EVT_CLOSE, self.on_close)
         self.pnl_file.bind_input_path_changed(self.on_text_changed_txt_input)
         self.pnl_file.bind_output_path_changed(self.on_text_changed_txt_output)
 
@@ -1381,18 +1443,55 @@ class MainFrame(wx.Frame):
         gc_collect()
 
     def on_click_btn_cancel(self, event):
-        self.suspend_event.set()
-        self.stop_event.set()
+        """Cancel button handler - cancels current operation (queue job or single job)"""
+        self.stop_event.set()  # Signal all operations to stop
+        
+        if self.queue_process:
+            # Cancel queue processing - keep cancel button enabled
+            self.queue_process = False
+            self.queue_idx = -1
+            self.btn_start_queue.Enable()
+            # Keep cancel button enabled so user can cancel current job
+            self.btn_suspend.Disable()
+            self.btn_suspend.SetLabel(T("Suspend"))
+            self.btn_autocrop_test.Enable()
+            self.update_start_button_state()
+            self.SetStatusText(T("Queue processing cancelled"))
+        elif self.processing:
+            # Cancel single job - keep buttons enabled so user can cancel
+            # processing will be set to False by on_exit_worker
+            self.btn_cancel.Enable()
+            self.btn_suspend.Enable()
+            self.SetStatusText(T("Cancelling..."))
+        else:
+            # No processing, just reset UI
+            self.btn_cancel.Disable()
+            self.btn_suspend.Disable()
+            self.btn_suspend.SetLabel(T("Suspend"))
+            self.btn_autocrop_test.Enable()
+            self.update_start_button_state()
 
     def on_click_btn_suspend(self, event):
-        if self.suspend_event.is_set():
-            self.suspend_event.clear()
-            self.btn_suspend.SetLabel(T("Resume"))
+        if self.queue_process:
+            # Queue is being processed, suspend/resume works at the job level
+            # The suspend button controls the current job's suspend state
+            if self.suspend_event.is_set():
+                self.suspend_event.clear()
+                self.btn_suspend.SetLabel(T("Resume"))
+            else:
+                self.start_time = time()
+                self.suspend_pos = self.prg_tqdm.GetValue()
+                self.suspend_event.set()
+                self.btn_suspend.SetLabel(T("Suspend"))
         else:
-            self.start_time = time()
-            self.suspend_pos = self.prg_tqdm.GetValue()
-            self.suspend_event.set()
-            self.btn_suspend.SetLabel(T("Suspend"))
+            if self.suspend_event.is_set():
+                self.suspend_event.clear()
+                self.btn_suspend.SetLabel(T("Resume"))
+            else:
+                self.start_time = time()
+                self.suspend_pos = self.prg_tqdm.GetValue()
+                self.suspend_event.set()
+                self.btn_suspend.SetLabel(T("Suspend"))
 
     def on_tqdm(self, event):
         type, value, desc = event.GetValue()
@@ -1522,6 +1621,423 @@ class MainFrame(wx.Frame):
                     return
             os.unlink(config_file)
         self.reload_preset()
+
+    def _get_flags_summary(self, args):
+        """Generate a readable summary of ALL job arguments/settings for debugging"""
+        flags_parts = []
+        
+        # Helper function to get value and format it nicely
+        def get_value(attr_name, default=None):
+            value = getattr(args, attr_name, None)
+            if value is None:
+                return None
+            if value == default:
+                return None
+            # Convert lists/tuples to readable strings
+            if isinstance(value, (list, tuple)):
+                return ",".join(str(v) for v in value)
+            return value
+        
+        # Build summary from all relevant args attributes
+        # Get all attributes from args object (excluding private attributes and state)
+        for attr_name in sorted(dir(args)):
+            if attr_name.startswith('_'):
+                continue
+            if attr_name == 'state':
+                continue
+            
+            value = get_value(attr_name)
+            if value is None:
+                continue
+            
+            # Format the attribute name nicely
+            display_name = attr_name.replace('_', ' ').title().replace(' ', '_')
+            
+            # Special formatting for known attributes
+            if attr_name == 'divergence':
+                display_name = 'Div'
+                flags_parts.append(f"{display_name}:{value}")
+            elif attr_name == 'convergence':
+                display_name = 'Cnv'
+                flags_parts.append(f"{display_name}:{value}")
+            elif attr_name == 'depth_model':
+                flags_parts.append(f"Depth:{value}")
+            elif attr_name == 'method':
+                flags_parts.append(f"Method:{value}")
+            elif attr_name == 'stereo_format':
+                flags_parts.append(f"Format:{value}")
+            elif attr_name == 'video_codec':
+                flags_parts.append(f"Codec:{value}")
+            elif attr_name == 'start_time':
+                flags_parts.append(f"Start:{value}")
+            elif attr_name == 'end_time':
+                flags_parts.append(f"End:{value}")
+            elif attr_name == 'crf':
+                flags_parts.append(f"CRF:{value}")
+            elif attr_name == 'preset':
+                flags_parts.append(f"Preset:{value}")
+            elif attr_name == 'tune':
+                flags_parts.append(f"Tune:{value}")
+            elif attr_name == 'batch_size':
+                flags_parts.append(f"Batch:{value}")
+            elif attr_name == 'foreground_scale':
+                flags_parts.append(f"Foreground:{value}")
+            elif attr_name == 'edge_dilation':
+                flags_parts.append(f"Edge:{value}")
+            elif attr_name == 'ipd_offset':
+                flags_parts.append(f"IPD:{value}")
+            elif attr_name == 'synthetic_view':
+                flags_parts.append(f"SynView:{value}")
+            elif attr_name == 'convergence_mode':
+                flags_parts.append(f"CnvMode:{value}")
+            elif attr_name == 'resolution':
+                flags_parts.append(f"Res:{value}")
+            elif attr_name == 'max_workers':
+                flags_parts.append(f"Workers:{value}")
+            elif attr_name == 'max_fps':
+                flags_parts.append(f"FPS:{value}")
+            elif attr_name == 'video_bitrate':
+                flags_parts.append(f"Bitrate:{value}")
+            elif attr_name == 'profile_level':
+                flags_parts.append(f"Profile:{value}")
+            elif attr_name == 'limit_resolution':
+                flags_parts.append(f"LimRes:{value}")
+            elif attr_name == 'stereo_width':
+                flags_parts.append(f"StereoW:{value}")
+            elif attr_name == 'mask_inner_dilation':
+                flags_parts.append(f"MaskInner:{value}")
+            elif attr_name == 'mask_outer_dilation':
+                flags_parts.append(f"MaskOuter:{value}")
+            elif attr_name == 'inpaint_max_width':
+                flags_parts.append(f"InpaintW:{value}")
+            elif attr_name == 'ema_normalize':
+                flags_parts.append(f"EMA:{value}")
+            elif attr_name == 'ema_decay':
+                flags_parts.append(f"EMADecay:{value}")
+            elif attr_name == 'ema_buffer':
+                flags_parts.append(f"EMABuf:{value}")
+            elif attr_name == 'scene_detect':
+                flags_parts.append(f"SceneDetect:{value}")
+            elif attr_name == 'disable_scene_cache':
+                flags_parts.append(f"SceneCache:{not value}")
+            elif attr_name == 'depth_aa':
+                flags_parts.append(f"DepthAA:{value}")
+            elif attr_name == 'preserve_screen_border':
+                flags_parts.append(f"PreserveBorder:{value}")
+            elif attr_name == 'pad_mode':
+                flags_parts.append(f"PadMode:{value}")
+            elif attr_name == 'pad':
+                flags_parts.append(f"Pad:{value}")
+            elif attr_name == 'rotate_left':
+                flags_parts.append(f"RotateL:{value}")
+            elif attr_name == 'rotate_right':
+                flags_parts.append(f"RotateR:{value}")
+            elif attr_name == 'disable_exif_transpose':
+                flags_parts.append(f"EXIF:{not value}")
+            elif attr_name == 'vf':
+                flags_parts.append(f"VF:{value}")
+            elif attr_name == 'max_output_width':
+                flags_parts.append(f"MaxW:{value}")
+            elif attr_name == 'max_output_height':
+                flags_parts.append(f"MaxH:{value}")
+            elif attr_name == 'keep_aspect_ratio':
+                flags_parts.append(f"KeepAR:{value}")
+            elif attr_name == 'autocrop':
+                flags_parts.append(f"Autocrop:{value}")
+            elif attr_name == 'tta':
+                flags_parts.append(f"TTA:{value}")
+            elif attr_name == 'disable_amp':
+                flags_parts.append(f"FP16:{not value}")
+            elif attr_name == 'low_vram':
+                flags_parts.append(f"LowVRAM:{value}")
+            elif attr_name == 'cuda_stream':
+                flags_parts.append(f"CUDASTREAM:{value}")
+            elif attr_name == 'compile':
+                flags_parts.append(f"Compile:{value}")
+            elif attr_name == 'resume':
+                flags_parts.append(f"Resume:{value}")
+            elif attr_name == 'recursive':
+                flags_parts.append(f"Recursive:{value}")
+            elif attr_name == 'skip_error':
+                flags_parts.append(f"SkipErr:{value}")
+            elif attr_name == 'metadata':
+                flags_parts.append(f"Metadata:{value}")
+            elif attr_name == 'format':
+                flags_parts.append(f"Format:{value}")
+            elif attr_name == 'pix_fmt':
+                flags_parts.append(f"PixFmt:{value}")
+            elif attr_name == 'colorspace':
+                flags_parts.append(f"Colorspace:{value}")
+            elif attr_name == 'video_format':
+                flags_parts.append(f"VidFormat:{value}")
+            elif attr_name == 'export':
+                flags_parts.append(f"Export:{value}")
+            elif attr_name == 'export_disparity':
+                flags_parts.append(f"ExportDisp:{value}")
+            elif attr_name == 'export_depth_only':
+                flags_parts.append(f"ExportDepth:{value}")
+            elif attr_name == 'export_depth_fit':
+                flags_parts.append(f"ExportDepthFit:{value}")
+            elif attr_name == 'debug_depth':
+                flags_parts.append(f"DebugDepth:{value}")
+            elif attr_name == 'input':
+                flags_parts.append(f"Input:{value}")
+            elif attr_name == 'output':
+                flags_parts.append(f"Output:{value}")
+            elif attr_name == 'gpu':
+                # Handle gpu as list or int
+                if isinstance(value, (list, tuple)):
+                    flags_parts.append(f"GPU:{value}")
+                else:
+                    flags_parts.append(f"GPU:{value}")
+            else:
+                # For any other attributes, include them with the formatted name
+                flags_parts.append(f"{display_name}:{value}")
+        
+        # Return combined flags
+        summary = " | ".join(flags_parts)
+        if not summary:
+            summary = "None"
+        return summary
+
+    def on_click_btn_add_queue(self, event):
+        input_path = self.pnl_file.input_path
+        output_path = self.pnl_file.output_path
+        if not input_path or not output_path:
+            with wx.MessageDialog(None,
+                                  message=T("Please set input and output paths first."),
+                                  caption=T("Error"), style=wx.OK) as dlg:
+                dlg.ShowModal()
+            return
+
+        # Parse args to save the current configuration
+        args = self.parse_args(skip_set_state=True)
+        if args is None:
+            return
+
+        # Create a job entry with full args object
+        job = {
+            "input": input_path,
+            "output": output_path,
+            "args": args,
+            "status": "Pending"
+        }
+        self.queue_jobs.append(job)
+
+        # Add to list queue
+        index = self.list_queue.InsertItem(self.list_queue.GetItemCount(), path.basename(input_path))
+        self.list_queue.SetItem(index, 1, path.basename(output_path))
+        self.list_queue.SetItem(index, 2, "Pending")
+        self.list_queue.SetItem(index, 3, self._get_flags_summary(args))
+
+        with wx.MessageDialog(None,
+                              message=T("Job added to queue."),
+                              caption=T("Info"), style=wx.OK) as dlg:
+            dlg.ShowModal()
+
+    def on_click_btn_remove_queue(self, event):
+        selected = self.list_queue.GetSelectedItemCount()
+        if selected == 0:
+            with wx.MessageDialog(None,
+                                  message=T("Please select a job to remove."),
+                                  caption=T("Error"), style=wx.OK) as dlg:
+                dlg.ShowModal()
+            return
+
+        # Get selected item index
+        index = self.list_queue.GetFirstSelected()
+        if index >= 0:
+            # Remove from queue jobs list
+            if index < len(self.queue_jobs):
+                del self.queue_jobs[index]
+            # Remove from list control
+            self.list_queue.DeleteItem(index)
+
+    def on_click_btn_clear_queue(self, event):
+        if not self.queue_jobs:
+            with wx.MessageDialog(None,
+                                  message=T("Queue is already empty."),
+                                  caption=T("Info"), style=wx.OK) as dlg:
+                dlg.ShowModal()
+            return
+
+        with wx.MessageDialog(None,
+                              message=T("Clear all jobs from queue?"),
+                              caption=T("Confirm"), style=wx.YES_NO) as dlg:
+            if dlg.ShowModal() == wx.ID_YES:
+                self.queue_jobs.clear()
+                self.list_queue.DeleteAllItems()
+
+    def on_click_btn_start_queue(self, event):
+        if not self.queue_jobs:
+            wx.MessageBox(T("Queue is empty. Add jobs first."), T("Error"), wx.OK)
+            return
+        if self.queue_process or self.processing:
+            wx.MessageBox(T("Processing is already in progress."), T("Info"), wx.OK)
+            return
+
+        self.btn_autocrop_test.Disable()
+        self.btn_start_queue.Disable()
+        self.btn_add_queue.Disable()
+        self.btn_cancel.Enable()
+        self.btn_suspend.Enable()
+
+        self.queue_process = True
+        self.queue_idx = -1
+        self.queue_shutdown = self.chk_shutdown_queue.IsChecked()
+
+        self._process_next_queue_job()  # Direct call for first job
+
+    def on_click_btn_clear_completed(self, event):
+        # Remove completed jobs from the queue
+        completed_indices = []
+        for i, job in enumerate(self.queue_jobs):
+            if job.get("status") == "Completed":
+                completed_indices.append(i)
+
+        if not completed_indices:
+            with wx.MessageDialog(None,
+                                  message=T("No completed jobs to clear."),
+                                  caption=T("Info"), style=wx.OK) as dlg:
+                dlg.ShowModal()
+            return
+
+        # Remove from GUI list (in reverse order to maintain indices)
+        for i in reversed(completed_indices):
+            self.list_queue.DeleteItem(i)
+            del self.queue_jobs[i]
+
+    def on_select_queue_item(self, event):
+        # Handle item selection in queue
+        pass
+
+    def on_deselect_queue_item(self, event):
+        # Handle item deselection in queue
+        pass
+
+    def on_shutdown_queue_changed(self, event):
+        pass
+
+    def _process_next_queue_job(self):
+        if not self.queue_process:
+            return
+
+        self.queue_idx += 1
+        current_idx = self.queue_idx
+        if self.queue_idx >= len(self.queue_jobs):
+            self.queue_process = False
+            self.queue_idx = -1
+            self.btn_start_queue.Enable()
+            self.btn_add_queue.Enable()
+            self.btn_cancel.Disable()
+            self.btn_suspend.Disable()
+            self.btn_autocrop_test.Enable()
+            self.update_start_button_state()
+            self.SetStatusText(T("Queue processing completed."))
+            return
+
+        job = self.queue_jobs[current_idx]
+        job["status"] = "Processing"
+        self.list_queue.SetItem(current_idx, 2, "Processing")
+
+        args = job["args"]
+        if args is None:
+            job["status"] = "Failed"
+            self.list_queue.SetItem(current_idx, 2, "Failed")
+            wx.CallAfter(self._process_next_queue_job)
+            return
+
+        # Fix: populate state for queued jobs (same as single Start button)
+        set_state_args(
+            args,
+            stop_event=self.stop_event,
+            suspend_event=self.suspend_event,
+            tqdm_fn=functools.partial(TQDMGUI, self),
+            depth_model=self.depth_model)
+
+        if not self.confirm_overwrite(args):
+            job["status"] = "Skipped"
+            self.list_queue.SetItem(current_idx, 2, "Skipped")
+            wx.CallAfter(self._process_next_queue_job)
+            return
+
+        # Exact match to on_click_btn_start
+        self.btn_autocrop_test.Disable()
+        self.btn_start_queue.Disable()
+        self.btn_add_queue.Disable()
+        self.btn_cancel.Enable()
+        self.btn_suspend.Enable()
+        self.stop_event.clear()
+        self.suspend_event.set()
+        self.prg_tqdm.SetValue(0)
+        self.SetStatusText("...")
+
+        if args.state["depth_model"].has_checkpoint_file(args.depth_model):
+            self.SetStatusText(f"Loading {args.depth_model}...")
+        else:
+            self.SetStatusText(f"Downloading {args.depth_model}...")
+
+        startWorker(self.on_exit_worker_queue, iw3_main, wargs=(args,))
+        self.processing = True
+
+    def on_exit_worker_queue(self, result):
+        try:
+            args = result.get()
+            self.depth_model = args.state["depth_model"]
+            self.depth_model_type = args.depth_model
+            self.depth_model_device_id = args.gpu
+            self.depth_model_height = args.resolution
+            self.depth_model_limit_resolution = args.limit_resolution
+
+            if not self.stop_event.is_set():
+                self.prg_tqdm.SetValue(self.prg_tqdm.GetRange())
+                self.SetStatusText(T("Finished"))
+            else:
+                self.SetStatusText(T("Cancelled"))
+        except:  # noqa
+            self.SetStatusText(T("Error"))
+            e_type, e, tb = sys.exc_info()
+            message = getattr(e, "message", str(e))
+            traceback.print_tb(tb)
+            wx.MessageBox(message, f"{T('Error')}: {e.__class__.__name__}", wx.OK | wx.ICON_ERROR)
+
+        current_idx = self.queue_idx
+        if current_idx < len(self.queue_jobs):
+            job = self.queue_jobs[current_idx]
+            if not self.stop_event.is_set():
+                job["status"] = "Completed"
+                self.list_queue.SetItem(current_idx, 2, "Completed")
+            else:
+                job["status"] = "Cancelled"
+                self.list_queue.SetItem(current_idx, 2, "Cancelled")
+
+        gc_collect()
+
+        if self.queue_process and self.queue_idx + 1 < len(self.queue_jobs):
+            wx.CallAfter(self._process_next_queue_job)
+        else:
+            if self.queue_shutdown:
+                os.system('shutdown /s /t 300 /c "All iw3 queue jobs completed. Computer will shut down in 5 minutes. Use shutdown /a to cancel."')
+                with wx.MessageDialog(None,
+                                      message=T("Computer will shut down in 5 minutes.\n\nClick Abort Shutdown to cancel."),
+                                      caption=T("Shutdown Scheduled"),
+                                      style=wx.OK | wx.ICON_WARNING) as dlg:
+                    dlg.SetOKLabel(T("Abort Shutdown"))
+                    if dlg.ShowModal() == wx.ID_OK:
+                        try:
+                            os.system("shutdown /a")
+                        except:
+                            pass
+            self.queue_process = False
+            self.queue_idx = -1
+            self.processing = False
+            self.btn_cancel.Disable()
+            self.btn_suspend.Disable()
+            self.btn_suspend.SetLabel(T("Suspend"))
+            self.btn_autocrop_test.Enable()
+            self.btn_start_queue.Enable()
+            self.btn_add_queue.Enable()
+            self.update_start_button_state()
 
     def on_click_btn_load_preset(self, event):
         self.load_preset(self.cbo_app_preset.GetValue(), exclude_names={self.GetName()})
