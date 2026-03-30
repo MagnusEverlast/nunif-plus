@@ -9,4 +9,5 @@ Everything is in the gui.py file in IW3 so just copy that over to your copy if y
 
 
 
-<img width="2049" height="1279" alt="Screenshot 2026-03-30 195044" src="https://github.com/user-attachments/assets/f509d5ea-a7bc-4b34-a3af-d3f3b17e070c" />
+
+<img width="2049" height="1279" alt="Screenshot 2026-03-30 201851" src="https://github.com/user-attachments/assets/1d12c773-ae17-44e0-83a9-b32558dafd03" />
