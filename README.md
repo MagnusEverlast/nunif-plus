@@ -1,5 +1,8 @@
 Get orginal stable version here (https://github.com/nagadomi/nunif)
 
+30/03/2026 Update: fork made added render queue and shut down.
+31/03/2026 Update: Made sure VRAM resets after every queued job. Made sure new button "cancel all" fully does it's job.
+
 This is my personal fork as I use IW3 and I coded a render queue and shut down computer tick box.
 
 Everything is in the gui.py file in IW3 so just copy that over to your copy if you have already installed it.
