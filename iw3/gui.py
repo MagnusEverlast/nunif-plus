@@ -701,7 +701,7 @@ class MainFrame(wx.Frame):
         self.btn_remove_queue = wx.Button(self.pnl_queue, label=T("Remove"))
         self.btn_clear_queue = wx.Button(self.pnl_queue, label=T("Clear"))
         self.btn_start_queue = wx.Button(self.pnl_queue, label=T("Start Queue"))
-        self.btn_clear_completed = wx.Button(self.pnl_queue, label=T("Clear Completed"))
+        self.btn_cancel_all = wx.Button(self.pnl_queue, label=T("Cancel All"))
         self.chk_shutdown_queue = wx.CheckBox(self.pnl_queue, label=T("Shutdown when finished"),
                                              name="chk_shutdown_queue")
         self.chk_shutdown_queue.SetMinSize(self.FromDIP((280, -1)))
@@ -712,7 +712,7 @@ class MainFrame(wx.Frame):
         btn_row.Add(self.btn_remove_queue, flag=wx.ALL, border=4)
         btn_row.Add(self.btn_clear_queue, flag=wx.ALL, border=4)
         btn_row.Add(self.btn_start_queue, flag=wx.ALL, border=4)
-        btn_row.Add(self.btn_clear_completed, flag=wx.ALL, border=4)
+        btn_row.Add(self.btn_cancel_all, flag=wx.ALL, border=4)
 
         layout = wx.BoxSizer(wx.VERTICAL)
         layout.Add(self.lbl_queue, flag=wx.ALL, border=4)
@@ -744,7 +744,7 @@ class MainFrame(wx.Frame):
         self.btn_remove_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_remove_queue)
         self.btn_clear_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_clear_queue)
         self.btn_start_queue.Bind(wx.EVT_BUTTON, self.on_click_btn_start_queue)
-        self.btn_clear_completed.Bind(wx.EVT_BUTTON, self.on_click_btn_clear_completed)
+        self.btn_cancel_all.Bind(wx.EVT_BUTTON, self.on_click_btn_cancel_all)
         self.chk_shutdown_queue.Bind(wx.EVT_CHECKBOX, self.on_shutdown_queue_changed)
         self.list_queue.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select_queue_item)
         self.list_queue.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_deselect_queue_item)
@@ -1414,7 +1414,8 @@ class MainFrame(wx.Frame):
     def on_exit_worker(self, result):
         try:
             args = result.get()
-            self.depth_model = args.state["depth_model"]
+            # Store depth model info for next run
+            self.depth_model = args.state.get("depth_model")
             self.depth_model_type = args.depth_model
             self.depth_model_device_id = args.gpu
             self.depth_model_height = args.resolution
@@ -1438,33 +1439,21 @@ class MainFrame(wx.Frame):
         self.btn_suspend.SetLabel(T("Suspend"))
         self.btn_autocrop_test.Enable()
         self.update_start_button_state()
-
-        # free vram
+        # Final cleanup after processing completes
         gc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.empty_cache()
 
     def on_click_btn_cancel(self, event):
-        """Cancel button handler - cancels current operation (queue job or single job)"""
-        self.stop_event.set()  # Signal all operations to stop
-        
+        self.stop_event.set()
         if self.queue_process:
-            # Cancel queue processing - keep cancel button enabled
-            self.queue_process = False
-            self.queue_idx = -1
-            self.btn_start_queue.Enable()
-            # Keep cancel button enabled so user can cancel current job
-            self.btn_suspend.Disable()
-            self.btn_suspend.SetLabel(T("Suspend"))
-            self.btn_autocrop_test.Enable()
-            self.update_start_button_state()
-            self.SetStatusText(T("Queue processing cancelled"))
+            self.SetStatusText(T("Cancelling current job..."))
+            return
         elif self.processing:
-            # Cancel single job - keep buttons enabled so user can cancel
-            # processing will be set to False by on_exit_worker
-            self.btn_cancel.Enable()
-            self.btn_suspend.Enable()
             self.SetStatusText(T("Cancelling..."))
         else:
-            # No processing, just reset UI
             self.btn_cancel.Disable()
             self.btn_suspend.Disable()
             self.btn_suspend.SetLabel(T("Suspend"))
@@ -1888,25 +1877,21 @@ class MainFrame(wx.Frame):
 
         self._process_next_queue_job()  # Direct call for first job
 
-    def on_click_btn_clear_completed(self, event):
-        # Remove completed jobs from the queue
-        completed_indices = []
-        for i, job in enumerate(self.queue_jobs):
-            if job.get("status") == "Completed":
-                completed_indices.append(i)
-
-        if not completed_indices:
-            with wx.MessageDialog(None,
-                                  message=T("No completed jobs to clear."),
-                                  caption=T("Info"), style=wx.OK) as dlg:
-                dlg.ShowModal()
+    def on_click_btn_cancel_all(self, event):
+        if not self.queue_jobs:
             return
-
-        # Remove from GUI list (in reverse order to maintain indices)
-        for i in reversed(completed_indices):
-            self.list_queue.DeleteItem(i)
-            del self.queue_jobs[i]
-
+        self.stop_event.set()
+        self.SetStatusText(T("Stopping queue..."))
+        self.queue_process = False
+        # Force VRAM cleanup
+        gc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.empty_cache()
+        
+        # Clear all job references to allow garbage collection
+        self.queue_jobs.clear()
     def on_select_queue_item(self, event):
         # Handle item selection in queue
         pass
@@ -1983,7 +1968,8 @@ class MainFrame(wx.Frame):
     def on_exit_worker_queue(self, result):
         try:
             args = result.get()
-            self.depth_model = args.state["depth_model"]
+            # Store depth model info for next run
+            self.depth_model = args.state.get("depth_model")
             self.depth_model_type = args.depth_model
             self.depth_model_device_id = args.gpu
             self.depth_model_height = args.resolution
@@ -2003,19 +1989,30 @@ class MainFrame(wx.Frame):
 
         current_idx = self.queue_idx
         if current_idx < len(self.queue_jobs):
-            job = self.queue_jobs[current_idx]
-            if not self.stop_event.is_set():
-                job["status"] = "Completed"
-                self.list_queue.SetItem(current_idx, 2, "Completed")
-            else:
-                job["status"] = "Cancelled"
+            if self.stop_event.is_set():
+                self.queue_jobs[current_idx]["status"] = "Cancelled"
                 self.list_queue.SetItem(current_idx, 2, "Cancelled")
+            elif not self.stop_event.is_set():
+                self.queue_jobs[current_idx]["status"] = "Completed"
+                self.list_queue.SetItem(current_idx, 2, "Completed")
 
+        # Cleanup after each queue job
         gc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.empty_cache()
 
         if self.queue_process and self.queue_idx + 1 < len(self.queue_jobs):
             wx.CallAfter(self._process_next_queue_job)
         else:
+            # Final cleanup after all queue jobs complete
+            gc_collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+                
             if self.queue_shutdown:
                 os.system('shutdown /s /t 300 /c "All iw3 queue jobs completed. Computer will shut down in 5 minutes. Use shutdown /a to cancel."')
                 with wx.MessageDialog(None,
